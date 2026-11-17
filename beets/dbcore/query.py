@@ -266,6 +266,108 @@ class SubstringQuery(StringFieldQuery[str]):
         return pattern.lower() in value.lower()
 
 
+_TRUE_STRINGS = frozenset({"true", "yes", "t", "y", "on", "1"})
+_FALSE_STRINGS = frozenset({"false", "no", "f", "n", "off", "0"})
+_FLEX_NUMERIC_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _parse_number(value: str) -> float | int | None:
+    """Parse a numeric string, returning ``None`` for non-numeric values."""
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+
+def _parse_bool(value: str) -> bool | None:
+    """Parse a boolean string, returning ``None`` for non-boolean values."""
+    value = value.strip().lower()
+    if value in _TRUE_STRINGS:
+        return True
+    if value in _FALSE_STRINGS:
+        return False
+    return None
+
+
+def _classify_string(value: str) -> tuple[str, Any]:
+    """Classify a flexible-attribute string by its content.
+
+    Returns a ``(kind, parsed)`` pair where ``kind`` is ``"number"``,
+    ``"boolean"`` or ``"text"`` and ``parsed`` is the interpreted value.
+    """
+    stripped = value.strip()
+    if _FLEX_NUMERIC_RE.match(stripped):
+        return ("number", _parse_number(stripped))
+    boolean = _parse_bool(stripped)
+    if boolean is not None:
+        return ("boolean", boolean)
+    return ("text", value)
+
+
+class FlexQuery(SubstringQuery):
+    """A slow query for flexible attributes without a declared type.
+
+    Matching adapts to the stored value on each object: numbers match
+    numerically (including ``..`` ranges), booleans match as true/false,
+    lists match when any element matches, and plain text keeps the
+    case-insensitive substring semantics of `SubstringQuery`.
+    """
+
+    def match(self, obj: Model) -> bool:
+        return self._match_value(self.pattern, obj.get(self.field_name))
+
+    def _match_value(self, pattern: str, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (list, tuple)):
+            return any(self._match_value(pattern, element) for element in value)
+        if isinstance(value, str):
+            kind, parsed = _classify_string(value)
+            if kind == "number":
+                return self._match_number(pattern, parsed)
+            if kind == "boolean":
+                expected = _parse_bool(pattern)
+                return expected is not None and parsed is expected
+            return self.string_match(pattern, value)
+        if isinstance(value, bool):
+            expected = _parse_bool(pattern)
+            return expected is not None and value is expected
+        if isinstance(value, (int, float)):
+            return self._match_number(pattern, value)
+        return self.string_match(pattern, util.as_string(value))
+
+    def _match_number(self, pattern: str, value: float | int) -> bool:
+        if ".." in pattern:
+            low_str, high_str = pattern.split("..", 1)
+            low = _parse_number(low_str)
+            high = _parse_number(high_str)
+            # A non-empty side that fails to parse means the pattern is not a
+            # numeric range at all; an empty side means "unbounded".
+            if (low_str.strip() and low is None) or (
+                high_str.strip() and high is None
+            ):
+                return False
+            if low is not None and value < low:
+                return False
+            return not (high is not None and value > high)
+
+        number = _parse_number(pattern)
+        if number is not None:
+            return value == number
+        # Booleans are stored as the numeric strings "1"/"0", so a
+        # true/false pattern also matches numbers by truthiness.
+        boolean = _parse_bool(pattern)
+        if boolean is not None:
+            return bool(value) is boolean
+        return False
+
+
 class PathQuery(FieldQuery[bytes]):
     """A query that matches all items under a given path.
 

@@ -6,6 +6,10 @@ from functools import reduce
 from operator import or_
 from typing import TYPE_CHECKING, Any
 
+from beets import util
+
+from . import query
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -140,9 +144,6 @@ class FieldSort(Sort):
         return {self.field_name}
 
     def sort(self, objs: Sequence[AnyModel]) -> Sequence[AnyModel]:
-        # TODO: Support flexible attributes with different types (e.g. a mix
-        # of strings and numbers) without falling over.
-
         def key(obj: Model) -> Any:
             field_val = obj.get(self.field_name, None)
             if field_val is None:
@@ -150,17 +151,34 @@ class FieldSort(Sort):
                     # If the field is typed, use its null value.
                     field_val = obj._types[self.field_name].null
                 else:
-                    # If not, fall back to using an empty string.
-                    field_val = ""
-            if self.case_insensitive and isinstance(field_val, str):
-                field_val = field_val.lower()
-            # Nullable types (e.g. ``NullInteger``/``NullFloat``) use ``None``
-            # as their null value, so a field may be missing on some objects
-            # and present on others. Comparing ``None`` with a real value
-            # raises a ``TypeError``, so group all missing values together:
-            # this places them first when sorting ascending and last when
-            # descending, matching SQLite's default ordering of NULLs.
-            return (field_val is not None, field_val)
+                    # Untyped flexible fields sort missing values first.
+                    field_val = None
+
+            # Give every value a total order that is stable even when a
+            # column mixes different types: missing values first, numbers
+            # (and booleans) before text. Within each category the value
+            # itself is compared, so numbers sort numerically and text
+            # sorts lexicographically.
+            if field_val is None:
+                return (0, "")
+            if isinstance(field_val, str) and self.field_name not in obj._types:
+                kind, parsed = query._classify_string(field_val)
+                if kind in ("number", "boolean"):
+                    return (1, parsed)
+                value = (
+                    field_val.lower() if self.case_insensitive else field_val
+                )
+                return (2, value)
+            if isinstance(field_val, str):
+                value = (
+                    field_val.lower() if self.case_insensitive else field_val
+                )
+                return (2, value)
+            if isinstance(field_val, (list, tuple)):
+                value = "; ".join(util.as_string(v) for v in field_val)
+                value = value.lower() if self.case_insensitive else value
+                return (2, value)
+            return (1, field_val)
 
         return sorted(objs, key=key, reverse=not self.ascending)
 

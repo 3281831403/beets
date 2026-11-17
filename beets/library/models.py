@@ -158,6 +158,17 @@ class LibModel(dbcore.Model["Library"]):
             # Using an explicit table name resolves this.
             field = f"{cls._table}.{field}"
 
+        if (
+            not fast
+            and query_cls is dbcore.query.SubstringQuery
+            and field not in cls._types
+            and field not in cls._queries
+            and field not in cls._getters()
+        ):
+            # An undeclared flexible attribute. Use a query that adapts to
+            # the value's inferred type instead of plain substring matching.
+            query_cls = dbcore.query.FlexQuery
+
         return query_cls(field, pattern, fast)
 
     @classmethod

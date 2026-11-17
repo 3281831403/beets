@@ -135,12 +135,66 @@ class Type(ABC, Generic[T, N]):
 # Reusable types.
 
 
-class Default(Type[str, None]):
+def _flex_split(value: str) -> list[str]:
+    """Split a stored multi-value flexible attribute into its elements.
+
+    A trailing delimiter marks a list whose (single) last element would
+    otherwise be indistinguishable from a plain string.
+    """
+    parts = value.split(MULTI_VALUE_DELIMITER)
+    while parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
+class Default(Type):
+    """Type for flexible attributes without a declared type.
+
+    Values are stored as TEXT. Lists are serialized with the multi-value
+    delimiter and split back into lists on retrieval. Everything else is
+    kept as the string it was stored as, preserving the original display
+    and substring-based query semantics; the query and sort machinery
+    infer numbers and booleans from those strings on the fly (see
+    `query.FlexQuery`).
+    """
+
+    sql = "TEXT"
+    query = query.FlexQuery
     model_type = str
 
     @property
     def null(self) -> None:
         return None
+
+    def from_sql(self, sql_value: SQLiteType) -> Any:
+        if isinstance(sql_value, memoryview):
+            sql_value = bytes(sql_value).decode("utf-8", "ignore")
+        if isinstance(sql_value, str):
+            if MULTI_VALUE_DELIMITER in sql_value:
+                return _flex_split(sql_value)
+            return sql_value
+        return self.normalize(sql_value)
+
+    def to_sql(self, model_value: Any) -> SQLiteType:
+        if isinstance(model_value, (list, tuple)):
+            if not model_value:
+                return MULTI_VALUE_DELIMITER
+            joined = MULTI_VALUE_DELIMITER.join(
+                util.as_string(v) for v in model_value
+            )
+            if MULTI_VALUE_DELIMITER not in joined:
+                joined += MULTI_VALUE_DELIMITER
+            return joined
+        return model_value
+
+    def format(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            return "; ".join(util.as_string(v) for v in value)
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "ignore")
+        return str(value)
 
 
 class BaseInteger(Type[int, N]):
