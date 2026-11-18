@@ -356,34 +356,45 @@ def manipulate_files(session: ImportSession, task: ImportTask) -> None:
     """A coroutine (pipeline stage) that performs necessary file
     manipulations *after* items have been added to the library and
     finalizes each task.
+
+    The destructive part (removing duplicates, moving/copying files,
+    writing tags) is journaled: if any of it fails, every change made
+    for this task is rolled back so the library and the source files
+    return to their pre-import state, and the exception propagates.
     """
     if not task.skip:
-        if task.duplicate_action in (
-            DuplicateAction.REMOVE,
-            DuplicateAction.UPGRADE,
-        ):
-            task.remove_duplicates(session.lib)
+        try:
+            if task.duplicate_action in (
+                DuplicateAction.REMOVE,
+                DuplicateAction.UPGRADE,
+            ):
+                task.remove_duplicates(session.lib)
 
-        if session.config["move"]:
-            operation = MoveOperation.MOVE
-        elif session.config["copy"]:
-            operation = MoveOperation.COPY
-        elif session.config["link"]:
-            operation = MoveOperation.LINK
-        elif session.config["hardlink"]:
-            operation = MoveOperation.HARDLINK
-        elif session.config["reflink"].get() == "auto":
-            operation = MoveOperation.REFLINK_AUTO
-        elif session.config["reflink"]:
-            operation = MoveOperation.REFLINK
+            if session.config["move"]:
+                operation = MoveOperation.MOVE
+            elif session.config["copy"]:
+                operation = MoveOperation.COPY
+            elif session.config["link"]:
+                operation = MoveOperation.LINK
+            elif session.config["hardlink"]:
+                operation = MoveOperation.HARDLINK
+            elif session.config["reflink"].get() == "auto":
+                operation = MoveOperation.REFLINK_AUTO
+            elif session.config["reflink"]:
+                operation = MoveOperation.REFLINK
+            else:
+                operation = None
+
+            task.manipulate_files(
+                session=session,
+                operation=operation,
+                write=session.config["write"].get(bool),
+            )
+        except BaseException:
+            task.rollback(session.lib)
+            raise
         else:
-            operation = None
-
-        task.manipulate_files(
-            session=session,
-            operation=operation,
-            write=session.config["write"].get(bool),
-        )
+            task.commit_journal()
 
     # Progress, cleanup, and event.
     task.finalize(session)

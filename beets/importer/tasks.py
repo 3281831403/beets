@@ -21,6 +21,7 @@ from beets.util import extension
 from beets.util.extension import remux_mpeglayer3_wav
 
 from .actions import Action, DuplicateAction
+from .rollback import ImportRollback
 from .state import ImportState
 
 if TYPE_CHECKING:
@@ -266,6 +267,9 @@ class ImportTask(BaseImportTask):
     ) -> None:
         super().__init__(toppath, paths, items)
         self.is_album = True
+        # Journal of destructive filesystem/database operations, used to
+        # restore the pre-import state if the import fails partway.
+        self._rollback = ImportRollback()
 
     def set_choice(self, choice: Action | AlbumMatch | TrackMatch) -> None:
         """Given an AlbumMatch or TrackMatch object or an action constant,
@@ -381,6 +385,18 @@ class ImportTask(BaseImportTask):
         if self.match:  # TODO: redesign to remove the conditional
             self.match.apply_metadata()
 
+    def rollback(self, lib: library.Library) -> None:
+        """Undo all filesystem and database changes made for this task,
+        restoring the state from before the import.
+        """
+        self._rollback.rollback(lib)
+
+    def commit_journal(self) -> None:
+        """The task completed successfully: discard the rollback journal
+        and permanently delete any files it holds.
+        """
+        self._rollback.commit()
+
     def duplicate_items(self, lib: library.Library) -> list[library.Item]:
         duplicate_items: list[library.Item] = []
         for album in self.find_duplicates(lib):
@@ -396,11 +412,13 @@ class ImportTask(BaseImportTask):
         log.debug("removing {} old duplicate albums", len(duplicate_albums))
 
         for album in duplicate_albums:
-            for item in album.items():
+            album_items = list(album.items())
+            self._rollback.record_removed(album_items, [album])
+            for item in album_items:
                 item.remove(with_album=False)
                 if lib.contains(item):
                     log.debug("deleting duplicate {.filepath}", item)
-                    util.remove(item.path)
+                    self._rollback.trash(item.path, lib)
                     util.prune_dirs(
                         os.path.dirname(item.path),
                         lib.directory,
@@ -412,7 +430,7 @@ class ImportTask(BaseImportTask):
 
             if artpath and lib.contains(artpath):
                 log.debug("deleting duplicate album art {}", artpath)
-                util.remove(artpath)
+                self._rollback.trash(artpath, lib)
                 util.prune_dirs(
                     artpath.parent,
                     lib.directory,
@@ -431,11 +449,12 @@ class ImportTask(BaseImportTask):
         """
         superseded = self._upgrade_superseded or []
         log.debug("upgrade: removing {} superseded item(s)", len(superseded))
+        self._rollback.record_removed(superseded)
         for item in superseded:
             item.remove(with_album=False)
             if lib.contains(item):
                 log.debug("deleting superseded {.filepath}", item)
-                util.remove(item.path)
+                self._rollback.trash(item.path, lib)
                 util.prune_dirs(
                     os.path.dirname(item.path),
                     lib.directory,
@@ -451,10 +470,11 @@ class ImportTask(BaseImportTask):
             surviving = list(old_album.items())
             if not surviving:
                 artpath = old_album.art_filepath
+                self._rollback.record_removed(albums=[old_album])
                 old_album.remove(with_items=False)
                 if artpath and lib.contains(artpath):
                     log.debug("deleting duplicate album art {}", artpath)
-                    util.remove(artpath)
+                    self._rollback.trash(artpath, lib)
                     util.prune_dirs(
                         artpath.parent,
                         lib.directory,
@@ -672,19 +692,36 @@ class ImportTask(BaseImportTask):
                 # move in-library files. (Out-of-library files are
                 # copied/moved as usual).
                 old_path = item.path
-                if (
+                art_before = self._album_artpath(item)
+                move_in_library = (
                     operation != util.MoveOperation.MOVE
                     and self.replaced_items[item]
                     and session.lib.contains(item.filepath)
-                ):
-                    item.move()
+                )
+                effective_op = (
+                    util.MoveOperation.MOVE if move_in_library else operation
+                )
+                try:
+                    if move_in_library:
+                        item.move()
+                    else:
+                        # A normal import. Just copy files and keep track
+                        # of old paths.
+                        item.move(operation)
+                finally:
+                    # Journal whatever actually happened, even if the
+                    # operation failed partway (e.g. the file was moved
+                    # but a subsequent store raised).
+                    if item.path != old_path:
+                        if effective_op == util.MoveOperation.MOVE:
+                            self._rollback.file_moved(old_path, item.path)
+                        else:
+                            self._rollback.file_created(item.path)
+                    self._journal_art_move(item, art_before, effective_op)
+                if move_in_library:
                     # We moved the item, so remove the
                     # now-nonexistent file from old_paths.
                     self.old_paths.remove(old_path)
-                else:
-                    # A normal import. Just copy files and keep track of
-                    # old paths.
-                    item.move(operation)
 
             if write and (self.apply or self.choice_flag == Action.RETAG):
                 item.try_write()
@@ -694,6 +731,34 @@ class ImportTask(BaseImportTask):
                 item.store()
 
         plugins.send("import_task_files", session=session, task=self)
+
+    def _album_artpath(self, item: library.Item) -> util.PathBytes | None:
+        """Return the current art path of the item's album, if any.
+
+        Used to detect art moves performed as a side effect of
+        `Item.move` so they can be journaled for rollback.
+        """
+        if not self.is_album:
+            return None
+        album = item.get_album()
+        return album.artpath if album else None
+
+    def _journal_art_move(
+        self,
+        item: library.Item,
+        art_before: util.PathBytes | None,
+        operation: util.MoveOperation,
+    ) -> None:
+        """Record an album art move caused by an item move, if the art
+        path changed.
+        """
+        art_after = self._album_artpath(item)
+        if not art_after or art_after == art_before:
+            return
+        if operation == util.MoveOperation.MOVE and art_before is not None:
+            self._rollback.file_moved(art_before, art_after)
+        else:
+            self._rollback.file_created(art_after)
 
     def add(self, lib: library.Library) -> None:
         """Add the items as an album to the library and remove replaced items."""
@@ -714,6 +779,7 @@ class ImportTask(BaseImportTask):
                 self.album.store()
 
             self.reimport_metadata(lib)
+        self._rollback.record_added(self.imported_items(), [self.album])
 
     def record_replaced(self, lib: library.Library) -> None:
         """Records the replaced items and albums in the `replaced_items`
@@ -737,6 +803,12 @@ class ImportTask(BaseImportTask):
                 if replaced_album:
                     replaced_album_ids.add(dup_item.album_id)
                     self.replaced_albums[replaced_album.path] = replaced_album
+        # Snapshot the rows about to be deleted so a failed import can
+        # restore them.
+        self._rollback.record_removed(
+            [item for items in self.replaced_items.values() for item in items],
+            self.replaced_albums.values(),
+        )
 
     def reimport_metadata(self, lib: library.Library) -> None:
         """For reimports, preserves metadata for reimported items and
@@ -936,11 +1008,12 @@ class SingletonImportTask(ImportTask):
 
         duplicate_items = self.find_duplicates(lib)
         log.debug("removing {} old duplicated items", len(duplicate_items))
+        self._rollback.record_removed(duplicate_items)
         for item in duplicate_items:
             item.remove()
             if lib.contains(item):
                 log.debug("deleting duplicate {.filepath}", item)
-                util.remove(item.path)
+                self._rollback.trash(item.path, lib)
                 util.prune_dirs(
                     os.path.dirname(item.path),
                     lib.directory,
@@ -956,11 +1029,12 @@ class SingletonImportTask(ImportTask):
         """
         superseded = self._upgrade_superseded or []
         log.debug("upgrade: removing {} superseded item(s)", len(superseded))
+        self._rollback.record_removed(superseded)
         for item in superseded:
             item.remove()
             if lib.contains(item):
                 log.debug("deleting superseded {.filepath}", item)
-                util.remove(item.path)
+                self._rollback.trash(item.path, lib)
                 util.prune_dirs(
                     os.path.dirname(item.path),
                     lib.directory,
@@ -973,6 +1047,7 @@ class SingletonImportTask(ImportTask):
             self.remove_replaced(lib)
             lib.add(self.item)
             self.reimport_metadata(lib)
+        self._rollback.record_added([self.item])
 
     def infer_album_fields(self) -> None:
         raise NotImplementedError

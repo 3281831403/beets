@@ -58,6 +58,13 @@ Bug fixes
 - Import: ``duplicate_keys`` that use library field names such as ``mb_albumid``
   or ``mb_trackid`` now detect duplicates when a metadata-source match is
   applied, instead of treating the key as missing. :bug:`7067`
+- Import: importing an album is now atomic with respect to file failures. If
+  moving, copying or writing a file fails partway (for example when the disk
+  is full), every change made for that album is rolled back: files are moved
+  back or removed, files scheduled for deletion (such as replaced duplicates)
+  are restored, and the library database is returned to its pre-import state.
+  Rerunning the import then produces exactly the result of an uninterrupted
+  import.
 - :doc:`plugins/missing`: Fix the documentation of the ``--release-types``
   command-line option and the ``release_types`` configuration option, which
   still used their old names. :bug:`7172`
